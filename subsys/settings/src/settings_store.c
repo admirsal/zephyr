@@ -54,7 +54,11 @@ int settings_load_subtree(const char *subtree)
 	 */
 	settings_lock_take();
 	SYS_SLIST_FOR_EACH_CONTAINER(&settings_load_srcs, cs, cs_next) {
-		cs->cs_itf->csi_load(cs, &arg);
+		rc = cs->cs_itf->csi_load(cs, &arg);
+		if (rc != 0) {
+			settings_lock_release();
+			return rc;
+		}
 	}
 	rc = settings_commit_subtree(subtree);
 	settings_lock_release();
@@ -67,6 +71,7 @@ int settings_load_subtree_direct(
 	void                   *param)
 {
 	struct settings_store *cs;
+	int rc;
 
 	const struct settings_load_arg arg = {
 		.subtree = subtree,
@@ -81,7 +86,11 @@ int settings_load_subtree_direct(
 	 */
 	settings_lock_take();
 	SYS_SLIST_FOR_EACH_CONTAINER(&settings_load_srcs, cs, cs_next) {
-		cs->cs_itf->csi_load(cs, &arg);
+		rc = cs->cs_itf->csi_load(cs, &arg);
+		if (rc != 0) {
+			settings_lock_release();
+			return rc;
+		}
 	}
 	settings_lock_release();
 	return 0;

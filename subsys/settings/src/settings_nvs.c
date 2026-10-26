@@ -26,6 +26,8 @@ LOG_MODULE_DECLARE(settings, CONFIG_SETTINGS_LOG_LEVEL);
 struct settings_nvs_read_fn_arg {
 	struct nvs_fs *fs;
 	uint16_t id;
+	size_t len;
+	int error;
 };
 
 static int settings_nvs_load(struct settings_store *cs,
@@ -48,6 +50,11 @@ static ssize_t settings_nvs_read_fn(void *back_end, void *data, size_t len)
 	rd_fn_arg = (struct settings_nvs_read_fn_arg *)back_end;
 
 	rc = nvs_read(rd_fn_arg->fs, rd_fn_arg->id, data, len);
+	if (rc < 0) {
+		rd_fn_arg->error = rc;
+	} else if ((size_t)rc < MIN(len, rd_fn_arg->len)) {
+		rd_fn_arg->error = -EIO;
+	}
 	if (rc > (ssize_t)len) {
 		/* nvs_read signals that not all bytes were read
 		 * align read len to what was requested
@@ -87,7 +94,7 @@ static void settings_nvs_cache_add(struct settings_nvs *cf, const char *name,
 	cf->cache_next %= CONFIG_SETTINGS_NVS_NAME_CACHE_SIZE;
 }
 
-static uint16_t settings_nvs_cache_match(struct settings_nvs *cf, const char *name,
+static int settings_nvs_cache_match(struct settings_nvs *cf, const char *name,
 					 char *rdname, size_t len)
 {
 	uint16_t name_hash = crc16_ccitt(0xffff, name, strlen(name));
@@ -103,12 +110,14 @@ static uint16_t settings_nvs_cache_match(struct settings_nvs *cf, const char *na
 		}
 
 		rc = nvs_read(&cf->cf_nvs, cf->cache[i].name_id, rdname, len);
-		if (rc < 0) {
+		if (rc == -ENOENT) {
 			continue;
 		}
-
-		if ((size_t)rc >= len) {
-			continue;
+		if (rc < 0) {
+			return rc;
+		}
+		if (rc == 0 || (size_t)rc >= len || memchr(rdname, '\0', rc) != NULL) {
+			return -EINVAL;
 		}
 
 		rdname[rc] = '\0';
@@ -162,47 +171,29 @@ static int settings_nvs_load(struct settings_store *cs,
 		rc2 = nvs_read(&cf->cf_nvs, name_id + NVS_NAME_ID_OFFSET,
 			       &buf, sizeof(buf));
 
-		if ((rc1 <= 0) && (rc2 <= 0)) {
-			/* Settings largest ID in use is invalid due to
-			 * reset, power failure or partition overflow.
-			 * Decrement it and check the next ID in subsequent
-			 * iteration.
-			 */
-			if (name_id == cf->last_name_id) {
-				cf->last_name_id--;
-				nvs_write(&cf->cf_nvs, NVS_NAMECNT_ID,
-					  &cf->last_name_id, sizeof(uint16_t));
-			}
-
+		/* Loading is read-only, including incomplete pairs left by power loss.
+		 * A later read failure must never follow an earlier cleanup write.
+		 */
+		if (rc1 < 0 && rc1 != -ENOENT) {
+			return rc1;
+		}
+		if (rc2 < 0 && rc2 != -ENOENT) {
+			return rc2;
+		}
+		if (rc1 == -ENOENT || rc2 == -ENOENT) {
 			continue;
 		}
-
-		if ((rc1 <= 0) || (rc2 <= 0)) {
-			/* Settings item is not stored correctly in the NVS.
-			 * NVS entry for its name or value is either missing
-			 * or deleted. Clean dirty entries to make space for
-			 * future settings item.
-			 */
-			nvs_delete(&cf->cf_nvs, name_id);
-			nvs_delete(&cf->cf_nvs, name_id + NVS_NAME_ID_OFFSET);
-
-			if (name_id == cf->last_name_id) {
-				cf->last_name_id--;
-				nvs_write(&cf->cf_nvs, NVS_NAMECNT_ID,
-					  &cf->last_name_id, sizeof(uint16_t));
-			}
-
-			continue;
-		}
-
-		if ((size_t)rc1 >= sizeof(name)) {
-			continue;
+		if (rc1 == 0 || rc2 == 0 || (size_t)rc1 >= sizeof(name) ||
+		    memchr(name, '\0', rc1) != NULL) {
+			return -EINVAL;
 		}
 
 		/* Found a name, this might not include a trailing \0 */
 		name[rc1] = '\0';
 		read_fn_arg.fs = &cf->cf_nvs;
 		read_fn_arg.id = name_id + NVS_NAME_ID_OFFSET;
+		read_fn_arg.len = rc2;
+		read_fn_arg.error = 0;
 
 #if CONFIG_SETTINGS_NVS_NAME_CACHE
 		settings_nvs_cache_add(cf, name, name_id);
@@ -213,6 +204,9 @@ static int settings_nvs_load(struct settings_store *cs,
 			name, rc2,
 			settings_nvs_read_fn, &read_fn_arg,
 			(void *)arg);
+		if (read_fn_arg.error != 0) {
+			return read_fn_arg.error;
+		}
 		if (ret) {
 			break;
 		}
@@ -239,7 +233,11 @@ static int settings_nvs_save(struct settings_store *cs, const char *name,
 #if CONFIG_SETTINGS_NVS_NAME_CACHE
 	bool name_in_cache = false;
 
-	name_id = settings_nvs_cache_match(cf, name, rdname, sizeof(rdname));
+	rc = settings_nvs_cache_match(cf, name, rdname, sizeof(rdname));
+	if (rc < 0) {
+		return rc;
+	}
+	name_id = rc;
 	if (name_id != NVS_NAMECNT_ID) {
 		write_name_id = name_id;
 		write_name = false;
@@ -268,15 +266,16 @@ static int settings_nvs_save(struct settings_store *cs, const char *name,
 		rc = nvs_read(&cf->cf_nvs, name_id, &rdname, sizeof(rdname));
 
 		if (rc < 0) {
-			/* Error or entry not found */
-			if (rc == -ENOENT) {
-				write_name_id = name_id;
+			if (rc != -ENOENT) {
+				return rc;
 			}
+			write_name_id = name_id;
 			continue;
 		}
 
-		if ((size_t)rc >= sizeof(rdname)) {
-			continue;
+		if (rc == 0 || (size_t)rc >= sizeof(rdname) ||
+		    memchr(rdname, '\0', rc) != NULL) {
+			return -EINVAL;
 		}
 
 		rdname[rc] = '\0';
@@ -384,11 +383,15 @@ int settings_nvs_backend_init(struct settings_nvs *cf)
 
 	rc = nvs_read(&cf->cf_nvs, NVS_NAMECNT_ID, &last_name_id,
 		      sizeof(last_name_id));
-	if (rc < 0) {
-		cf->last_name_id = NVS_NAMECNT_ID;
-	} else {
-		cf->last_name_id = last_name_id;
+	if (rc == -ENOENT) {
+		last_name_id = NVS_NAMECNT_ID;
+	} else if (rc < 0) {
+		return rc;
+	} else if (rc != sizeof(last_name_id) || last_name_id < NVS_NAMECNT_ID ||
+		   last_name_id >= NVS_NAMECNT_ID + NVS_NAME_ID_OFFSET) {
+		return -EINVAL;
 	}
+	cf->last_name_id = last_name_id;
 
 	LOG_DBG("Initialized");
 	return 0;
